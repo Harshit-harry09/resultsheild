@@ -1,0 +1,220 @@
+# ResultShield docker-compose.yml
+# Source of truth: techspec.md Section 7, rules.md Section 10
+#
+# CRITICAL: backend has NO host port mapping — only expose: ["3000"]
+# This is what allows `docker compose up -d --scale backend=N` to work
+# without "port already allocated" errors. (PRD bug #1)
+#
+# Traefik uses Docker provider for service discovery — new replicas are
+# automatically routed without any config reload. (PRD bug #2)
+#
+# Setup sequence (tracker.md Section 1):
+#   1. docker compose up -d postgres redis pgbouncer ...
+#   2. node db/seed/generate-synthetic-results.js    ← FIRST
+#   3. node scripts/prewarm-cache.js                 ← SECOND
+#   4. docker compose up -d --build backend frontend
+
+services:
+
+  # ── Traefik: entry point + Docker-native service discovery ──────────────
+  traefik:
+    image: traefik:latest
+    container_name: resultshield-traefik
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=resultshield"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--log.level=WARN"
+    ports:
+      - "80:80"       # Main app entry
+      - "8080:8080"   # Traefik dashboard
+    volumes:
+      # Docker socket — this is how Traefik discovers containers dynamically.
+      # New backend replicas appear in Traefik routing automatically, no reload.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [resultshield]
+    restart: unless-stopped
+
+  # ── Frontend: React SPA served via Nginx ────────────────────────────────
+  frontend:
+    build: ./frontend
+    container_name: resultshield-frontend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+    networks: [resultshield]
+    depends_on:
+      - traefik
+    restart: unless-stopped
+
+  # ── Backend: Node.js API — NO HOST PORT (critical for scaling) ───────────
+  # NEVER add `ports:` here. Use only `expose:` so Docker can scale freely.
+  # Traefik routes to replicas via the internal Docker network.
+  backend:
+    build: ./backend
+    # No container_name — auto-named, required for --scale to work
+    expose: ["3000"]   # internal only, no host port mapping
+    environment:
+      - DATABASE_URL=postgres://app:app@pgbouncer:5432/results
+      - REDIS_URL=redis://redis:6379
+      - PORT=3000
+      - MAX_CONCURRENT_ADMITTED=1000
+      - RATE_LIMIT_UNAUTHENTICATED_RPM=20
+      - CACHE_TTL_SECONDS=172800
+      - STAMPEDE_LOCK_TTL_SECONDS=5
+      - STAMPEDE_WAIT_RETRY_MS=100
+      - STAMPEDE_MAX_WAIT_MS=4500
+      - SHUTDOWN_GRACE_MS=10000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.backend.priority=10"
+      - "traefik.http.services.backend.loadbalancer.server.port=3000"
+      # Active health check — Traefik stops routing to a replica that fails /health
+      # Interval must match rules.md Section 6: 5s
+      - "traefik.http.services.backend.loadbalancer.healthcheck.path=/health"
+      - "traefik.http.services.backend.loadbalancer.healthcheck.interval=5s"
+      - "traefik.http.services.backend.loadbalancer.healthcheck.timeout=3s"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+    networks: [resultshield]
+    stop_grace_period: 20s
+    restart: unless-stopped
+    # NOTE: No deploy.replicas — replica count always set explicitly:
+    #   docker compose up -d --scale backend=N
+
+  # ── Redis: cache + centralized queue state ───────────────────────────────
+  # All backend replicas share this single Redis instance —
+  # this is what makes queue:waiting and capacity:admitted_count consistent
+  # across replicas (PRD bug #4 fix).
+  redis:
+    image: redis:7-alpine
+    container_name: resultshield-redis
+    # No persistence — intentional (schema.md Section 6)
+    command: redis-server --save "" --appendonly no
+    networks: [resultshield]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── PgBouncer: connection pooling ──────────────────────────────────────
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: resultshield-pgbouncer
+    environment:
+      - DATABASE_URL=postgres://app:app@postgres:5432/results
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=1000
+      - DEFAULT_POOL_SIZE=40
+      - SERVER_IDLE_TIMEOUT=600
+      - LOG_CONNECTIONS=0
+      - LOG_DISCONNECTIONS=0
+      - AUTH_TYPE=scram-sha-256
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U app"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [resultshield]
+    restart: unless-stopped
+
+  # ── PostgreSQL: source of truth ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: resultshield-postgres
+    environment:
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=app
+      - POSTGRES_DB=results
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    networks: [resultshield]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d results"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── cAdvisor: per-container CPU/memory metrics ──────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: resultshield-cadvisor
+    ports:
+      - "8081:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks: [resultshield]
+    restart: unless-stopped
+
+  # ── Prometheus: metrics collection with Docker SD ───────────────────────
+  # Uses docker_sd_configs — new backend replicas are scraped automatically
+  # without editing any target list. (PRD bug #6 fix)
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    user: root
+    container_name: resultshield-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    networks: [resultshield]
+    restart: unless-stopped
+
+  # ── Grafana: dashboards ─────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: resultshield-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks: [resultshield]
+    restart: unless-stopped
+
+networks:
+  resultshield:
+    driver: bridge
+    name: resultshield
+
+volumes:
+  pgdata:
+  grafana-data:
+  prometheus-data:

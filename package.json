@@ -1,0 +1,24 @@
+{
+  "name": "resultshield",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ResultShield — run scripts from the project root",
+  "scripts": {
+    "dev": "concurrently --names \"API,UI\" --prefix-colors \"cyan,magenta\" \"npm run dev:api\" \"npm run dev:ui\"",
+    "dev:api": "node backend/dev-server.js",
+    "dev:ui": "cd frontend && npm run dev",
+    "seed": "node db/seed/generate-synthetic-results.js",
+    "prewarm": "node scripts/prewarm-cache.js",
+    "k6:data": "node k6/generate-data.js",
+    "k6:10": "k6 run k6/10-rps.js",
+    "k6:10k": "k6 run k6/10k-rps.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0"
+  }
+}

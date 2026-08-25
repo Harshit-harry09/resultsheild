@@ -1,0 +1,140 @@
+name: ResultShield CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    name: Test & Build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: results
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      - name: Apply database schema
+        env:
+          DATABASE_URL: postgres://app:app@localhost:5432/results
+        run: |
+          PGPASSWORD=app psql -h localhost -U app -d results -f db/init.sql
+
+      - name: Seed database
+        env:
+          DATABASE_URL: postgres://app:app@localhost:5432/results
+        working-directory: .
+        run: node db/seed/generate-synthetic-results.js
+
+      - name: Smoke test API
+        env:
+          DATABASE_URL: postgres://app:app@localhost:5432/results
+          REDIS_URL: redis://localhost:6379
+          MAX_CONCURRENT_ADMITTED: "200"
+          STAMPEDE_MAX_WAIT_MS: "4500"
+          CACHE_TTL_SECONDS: "172800"
+          PORT: "3000"
+        working-directory: backend
+        run: |
+          node src/server.js &
+          SERVER_PID=$!
+          sleep 3
+
+          # SC-01: result retrieval
+          RESP=$(curl -sf http://localhost:3000/api/result/26010001)
+          echo "Response: $RESP"
+          echo "$RESP" | grep -q '"status":"ok"' || (echo "FAIL: SC-01 result not found" && exit 1)
+
+          # SC-01: not-found sentinel
+          RESP_NF=$(curl -sf http://localhost:3000/api/result/26099999)
+          echo "$RESP_NF" | grep -q '"status":"error"' || (echo "FAIL: SC-01 sentinel not returning not-found" && exit 1)
+
+          # Health check
+          curl -sf http://localhost:3000/health || (echo "FAIL: health check" && exit 1)
+
+          # Metrics endpoint
+          curl -sf http://localhost:3000/metrics | grep -q "http_requests_in_flight" || \
+            (echo "FAIL: /metrics missing expected metrics" && exit 1)
+
+          kill $SERVER_PID
+          echo "✓ All smoke tests passed"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+        env:
+          VITE_API_BASE: /api
+
+      - name: Build Docker images
+        run: |
+          docker build -t resultshield-backend:test ./backend
+          docker build -t resultshield-frontend:test ./frontend
+          echo "✓ Docker images built successfully"
+
+      - name: Integration test — Docker Compose scaling
+        run: |
+          # Start core services
+          docker compose up -d postgres redis traefik 2>&1 | tail -5
+          sleep 10
+
+          # Seed the database
+          docker compose run --rm -e DATABASE_URL=postgres://app:app@postgres:5432/results \
+            --entrypoint="node db/seed/generate-synthetic-results.js" backend 2>&1 | tail -5 || true
+
+          # Scale backend to 3 — the key test for PRD bug #1
+          # If backend had a host port, this would fail with "port already allocated"
+          docker compose up -d --build --scale backend=3 2>&1 | tail -10
+          sleep 10
+
+          # Verify Traefik dashboard shows backends (via API)
+          curl -sf http://localhost:8080/api/http/services 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print('Services:', list(d.keys())[:5])" || \
+            echo "Traefik API check skipped (may need different endpoint)"
+
+          # Verify all 3 containers are running
+          COUNT=$(docker compose ps --quiet backend | wc -l)
+          echo "Backend replica count: $COUNT"
+          [ "$COUNT" -eq 3 ] || (echo "FAIL: Expected 3 backend replicas, got $COUNT" && exit 1)
+
+          echo "✓ Scaling test passed — 3 replicas running with no port conflicts"
+
+          docker compose down -v

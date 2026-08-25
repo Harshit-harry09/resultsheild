@@ -1,0 +1,44 @@
+# ResultShield .gitignore
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+.pnpm-debug.log*
+
+# Build output
+frontend/dist/
+frontend/.vite/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Docker volumes (never commit data)
+pgdata/
+grafana-data/
+prometheus-data/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# k6 data (can be regenerated)
+k6/data/roll-numbers.json
+
+# Test outputs and logs
+traefik-rawdata.json
+traffic-result.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/

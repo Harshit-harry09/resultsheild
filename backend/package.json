@@ -1,0 +1,26 @@
+{
+  "name": "resultshield-backend",
+  "version": "1.0.0",
+  "description": "ResultShield backend API — result portal with Redis caching, stampede protection, and virtual queue",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test src/**/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "ioredis": "^5.3.2",
+    "pg": "^8.12.0",
+    "prom-client": "^15.1.3",
+    "uuid": "^11.1.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ioredis-mock": "^8.13.1"
+  }
+}

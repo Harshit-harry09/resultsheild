@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+
+  # ── Backend replicas — auto-discovered via Docker SD ─────────────────────
+  # No static target list — new replicas created by the autoscaler are
+  # picked up automatically within 5 seconds. (PRD bug #6 fix)
+  - job_name: "resultshield-backend"
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Only scrape containers in the 'backend' compose service
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        regex: backend
+        action: keep
+      # Use the container's internal IP on port 3000
+      - source_labels: [__meta_docker_network_ip]
+        target_label: __address__
+        replacement: "${1}:3000"
+      # Useful labels for Grafana filtering
+      - source_labels: [__meta_docker_container_name]
+        target_label: instance
+    metrics_path: /metrics
+
+  # ── cAdvisor — per-container CPU and memory ───────────────────────────────
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    relabel_configs:
+      - source_labels: [container_label_com_docker_compose_service]
+        target_label: service
+
+  # ── Prometheus self-scrape ────────────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
